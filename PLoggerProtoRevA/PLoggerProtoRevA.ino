@@ -28,6 +28,8 @@
  * of a single load.
  */
 
+#define _DEBUG_  // for thinger.io debug messages
+
 #include <FS.h>
 #include <ESP8266WiFi.h>
 #include <DNSServer.h>
@@ -35,7 +37,7 @@
 #include <WiFiManager.h>
 #include "TwoColorLed.h"
 #include "SPI.h"
-#include <ThingerSmartConfig.h>
+#include <ThingerWifi.h>
 #include <EEPROM.h>
 
 /* define the thinger.io interface
@@ -46,7 +48,7 @@
  *    DEVICE_CREDENTIAL - secret key to connect
  */
 #include "thingerCredentials.h"
-ThingerSmartConfig thing(USERNAME, DEVICE_ID, DEVICE_CREDENTIAL);
+ThingerWifi thing(USERNAME, DEVICE_ID, DEVICE_CREDENTIAL);
 
 /* device status feedback LED
  * currently only responds to status of internet connection and valid calibration data
