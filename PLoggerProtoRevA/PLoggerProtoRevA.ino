@@ -109,6 +109,16 @@ uint16_t g_currentZeroCalibration = 0;
 
 uint32_t g_lastUpdateTime = 0;
 
+/* handles interrupts from a pin change and records up to two timestamps
+ */
+void ICACHE_RAM_ATTR timingHandler() {
+  if (!g_interruptTimerStart) {
+    g_interruptTimerStart = micros();
+  } else if (!g_interruptTimerEnd) {
+    g_interruptTimerEnd = micros();
+  }
+}
+
 void setup() {
     SPI.begin();
     pinMode( CURRENT_LEVEL_CS_PIN, OUTPUT );
@@ -178,7 +188,7 @@ void setup() {
 void loop() {
     if (millis() - g_lastUpdateTime >= 1000) {
       updateSenseValues();
-      cycleCalculation();
+      while (!cycleCalculation()) continue;
       g_lastUpdateTime = millis();
     }
     
@@ -239,39 +249,35 @@ void updateSenseValues() {
  * sin wave using the peak voltage and cycle period
  */
 bool cycleCalculation() {
-  if (!g_lineHz) return false;
   // get a rising edge from the voltage pulse to synchronize the timing of the voltage waveform
   g_interruptTimerStart = 0;
   g_interruptTimerEnd = 0;
   attachInterrupt( VOLTAGE_PULSE_PIN, timingHandler, RISING );
-  delay(50);
+  while (!g_interruptTimerEnd) {
+    yield();
+  }
   detachInterrupt( VOLTAGE_PULSE_PIN );
   
-  yield();
-  
   // local vars for entire cycle
-  long lastCurrentADC = 0;
-  long currentCurrentADC = 0;
-  
   long peakCurrent = 0;
   uint32_t maxTimeStep = 0;
-  
-  double accumulatorPowerPositive = 0;  // split these out for eventual reactive power analysys
-  double accumulatorPowerNegative = 0;
-  
-  uint32_t cycleLengthMicros = 1000000 / g_lineHz;
-  double radiansPerMicro = 2.0 * PI / (double)cycleLengthMicros;
+  long numSteps = 0;
+  float_t accumulatorPowerPositive = 0;  // split these out for eventual reactive power analysys
+  float_t accumulatorPowerNegative = 0;
+  uint32_t cycleLengthMicros = g_interruptTimerEnd - g_interruptTimerStart;
+  float_t radiansPerMicro = 2.0 * PI / (float_t)cycleLengthMicros;
   uint32_t cycleStartMicros = micros();
-  uint32_t currentMicros = cycleStartMicros;
-  uint32_t lastMicros = currentMicros;
   
   // local vars for each integration step
-  double averageCurrent = 0;
-  double lastRadians = 0;
-  double currentRadians = 0;
-  double averageNormalizedVoltage = 0;
+  long lastCurrentADC = 0;
+  long currentCurrentADC = 0;
+  uint32_t currentMicros = cycleStartMicros;
+  uint32_t lastMicros = currentMicros;
+  long averageCurrentADC = 0;
+  float_t averageRadians = 0;
+  float_t averageNormalizedVoltage = 0;
   uint32_t timestepMicros = 0;
-  double currentWeightedNormalizedPower = 0;
+  float_t currentWeightedNormalizedPower = 0;
   
   /* calculate the integral for one cycle period.
    * we substitute sin(radians) for the voltage and multiply by the peak later.
@@ -280,7 +286,7 @@ bool cycleCalculation() {
    */
   lastCurrentADC = adcRead( CURRENT_LEVEL_CS_PIN ) - g_currentZeroCalibration;
   while ( lastMicros - cycleStartMicros <= cycleLengthMicros ) {
-    wdt_reset();
+    ++numSteps;
     currentMicros = micros();
     currentCurrentADC = adcRead( CURRENT_LEVEL_CS_PIN ) - g_currentZeroCalibration;
     if (abs(currentCurrentADC) > peakCurrent) {
@@ -288,13 +294,12 @@ bool cycleCalculation() {
     }
     if (lastMicros) {
       // perform a numerical integration using straight line approximation
-      averageCurrent = (lastCurrentADC + currentCurrentADC) * ADC_CURRENT_FACTOR / 2;
-      lastRadians = (lastMicros - g_interruptTimerStart) * radiansPerMicro;
-      currentRadians = (currentMicros - g_interruptTimerStart) * radiansPerMicro;
-      averageNormalizedVoltage = ( sin(lastRadians) + sin(currentRadians) ) / 2;
+      averageCurrentADC = (lastCurrentADC + currentCurrentADC) / 2;
+      averageRadians = (lastMicros - g_interruptTimerStart + currentMicros - g_interruptTimerStart) / 2 * radiansPerMicro;
+      averageNormalizedVoltage = sin(averageRadians);
       timestepMicros = currentMicros - lastMicros;
       if (timestepMicros > maxTimeStep) maxTimeStep = timestepMicros;
-      currentWeightedNormalizedPower = averageCurrent * averageNormalizedVoltage * timestepMicros;
+      currentWeightedNormalizedPower = averageCurrentADC * averageNormalizedVoltage * timestepMicros;
       if (currentWeightedNormalizedPower > 0) {
         accumulatorPowerPositive += currentWeightedNormalizedPower;
       } else {
@@ -309,8 +314,8 @@ bool cycleCalculation() {
   
   // final conversions to real units and global var updates
   uint32_t totalMeasuredMicros = lastMicros - cycleStartMicros;
-  double powerPositive = accumulatorPowerPositive * g_voltagePk / totalMeasuredMicros;
-  double powerNegative = accumulatorPowerNegative * g_voltagePk / totalMeasuredMicros;
+  float_t powerPositive = accumulatorPowerPositive * g_voltagePk * ADC_CURRENT_FACTOR / totalMeasuredMicros;
+  float_t powerNegative = accumulatorPowerNegative * g_voltagePk * ADC_CURRENT_FACTOR / totalMeasuredMicros;
   g_current = peakCurrent * ADC_CURRENT_FACTOR / 1000;
   #ifdef DEBUG_MODE
   Serial.println();
@@ -322,12 +327,19 @@ bool cycleCalculation() {
   Serial.println(g_current, DEC);
   Serial.print("Max timestep: ");
   Serial.println(maxTimeStep, DEC);
+  Serial.print("Num steps: ");
+  Serial.println(numSteps);
+  Serial.print("Cycle start delay us: ");
+  Serial.println(cycleStartMicros-g_interruptTimerStart);
   #endif
   
-  if (powerPositive > -powerNegative) {
+  if (maxTimeStep < 1000) {
     g_powerReal = (powerPositive + powerNegative) / 1000;
     return true;
   } else {
+    #ifdef DEBUG_MODE
+    Serial.println("Cycle failed");
+    #endif
     return false;
   }
 }
@@ -532,12 +544,4 @@ float_t adcToCurrent( uint32_t value ) {
 }
 
 
-/* handles interrupts from a pin change and records up to two timestamps
- */
-void ICACHE_RAM_ATTR timingHandler() {
-  if (!g_interruptTimerStart) {
-    g_interruptTimerStart = micros();
-  } else if (!g_interruptTimerEnd) {
-    g_interruptTimerEnd = micros();
-  }
-}
+
