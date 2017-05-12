@@ -534,7 +534,7 @@ float_t adcToCurrent( uint32_t value ) {
 
 /* handles interrupts from a pin change and records up to two timestamps
  */
-void timingHandler() {
+void ICACHE_RAM_ATTR timingHandler() {
   if (!g_interruptTimerStart) {
     g_interruptTimerStart = micros();
   } else if (!g_interruptTimerEnd) {
