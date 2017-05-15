@@ -109,10 +109,16 @@ uint16_t g_currentZeroCalibration = 0;
 
 uint32_t g_lastUpdateTime = 0;
 
+
+// phase-sync parameters
+#define MIN_CYCLE_LEN 14285 // 70Hz
+#define MAX_CYCLE_LEN 25000 // 40Hz
+
 /* handles interrupts from a pin change and records up to two timestamps
  */
 void ICACHE_RAM_ATTR timingHandler() {
-  if (!g_interruptTimerStart) {
+  uint32_t length = micros() - g_interruptTimerStart;
+  if (!g_interruptTimerStart || length < MIN_CYCLE_LEN || length > MAX_CYCLE_LEN) {
     g_interruptTimerStart = micros();
   } else if (!g_interruptTimerEnd) {
     g_interruptTimerEnd = micros();
@@ -495,7 +501,9 @@ float_t senseLineHz() {
   g_interruptTimerStart = 0;
   g_interruptTimerEnd = 0;
   attachInterrupt( VOLTAGE_PULSE_PIN, timingHandler, RISING );
-  delay( 50 );
+  while (!g_interruptTimerEnd) {
+    yield();
+  }
   detachInterrupt( VOLTAGE_PULSE_PIN );
   if ( !g_interruptTimerStart || !g_interruptTimerEnd ) return 0;
   float_t cycleUs = g_interruptTimerEnd - g_interruptTimerStart;
@@ -509,12 +517,13 @@ float_t senseLineHz() {
 uint32_t sensePeakValue( const uint8_t csPin ) {
   if (!g_lineHz) return 0;  // must have a valid line hertz sensed
   g_interruptTimerStart = 0;
+  g_interruptTimerEnd = 0;
   long quarterCycleUs = 250000 / g_lineHz;
   yield(); // make sure the wdt has just been reset and chip has serviced other functions
   attachInterrupt( VOLTAGE_PULSE_PIN, timingHandler, RISING );
-  while (!g_interruptTimerStart) delay( 0 );
+  while (!g_interruptTimerEnd) yield();
   detachInterrupt( VOLTAGE_PULSE_PIN );
-  long delayTime = quarterCycleUs - (micros() - g_interruptTimerStart);
+  long delayTime = quarterCycleUs - (micros() - g_interruptTimerEnd);
   if (delayTime <= 0) return 0; // make sure we didn't miss our window
   delayMicroseconds( delayTime );
   uint32_t value = adcRead( csPin );
@@ -528,12 +537,13 @@ uint32_t sensePeakValue( const uint8_t csPin ) {
 uint32_t sensePeakVoltage() {
   if (!g_lineHz) return 0;  // must have a valid line hertz sensed
   g_interruptTimerStart = 0;
+  g_interruptTimerEnd = 0;
   long quarterCycleUs = 250000 / g_lineHz;
   yield(); // make sure the wdt has just been reset and chip has serviced other functions
   attachInterrupt( VOLTAGE_PULSE_PIN, timingHandler, RISING );
-  while (!g_interruptTimerStart) delay( 0 );
+  while (!g_interruptTimerEnd) yield();
   detachInterrupt( VOLTAGE_PULSE_PIN );
-  long delayTime = quarterCycleUs - (micros() - g_interruptTimerStart);
+  long delayTime = quarterCycleUs - (micros() - g_interruptTimerEnd);
   if (delayTime <= 0) return 0; // make sure we didn't miss our window
   delayMicroseconds( delayTime );
   uint32_t value = analogRead(VOLTAGE_LEVEL_PIN);
