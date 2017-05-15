@@ -73,13 +73,13 @@ TwoColorLed led( 4, 5, false );
 
 
 /* ADC factors for current/voltage conversions
- * the voltage factor is determined by the voltage divider (see schematic) and the ESP8266
+ * the voltage factor (V/bit) is determined by the voltage divider (see schematic) and the ESP8266
  *    analog pin range, 0-1.0V
- * the current factor is determined by the ACS722 range (-20A,20A) and the bit-depth
+ * the current factor (A/bit) is determined by the ACS722 range (-20A,20A) and the bit-depth
  *    of the ADC device.
  */
 #define ADC_VOLTAGE_FACTOR_10BIT 0.3873416081  // for analogReads, with 488.0/1.27 divider
-#define ADC_CURRENT_FACTOR_12BIT 12.207031 // for ADC121S021 and ACS722 at 3.3v
+#define ADC_CURRENT_FACTOR_12BIT .012207031 // for ADC121S021 and ACS722 at 3.3v
 
 // oversampling the current sensor provides better value resolution, at the expense of temporal resolution
 #define ADC_OVERSAMPLING_BITS 2  // the number of oversampling bits. maximum 4
@@ -103,7 +103,7 @@ float_t g_voltage = 0;
 float_t g_voltagePk = 0;
 float_t g_current = 0;
 float_t g_powerReal = 0;
-//float_t g_powerReactive = 0;  // for future implementation
+float_t g_powerFactor = 0;
 
 uint16_t g_currentZeroCalibration = 0;
 
@@ -182,6 +182,7 @@ void setup() {
     thing["volts_peak"] >> outputValue(g_voltage);
     thing["current_peak"] >> outputValue(g_current);
     thing["real_power"] >> outputValue(g_powerReal);
+    thing["power_factor"] >> outputValue(g_powerFactor);
     
 }
 
@@ -230,7 +231,7 @@ void calibrateCurrentSensor() {
  */
 void updateSenseValues() {
     float_t lineHz = senseLineHz();
-    float_t voltagePk = adcToVoltage( sensePeakVoltage() );
+    float_t voltagePk = sensePeakVoltage() * ADC_VOLTAGE_FACTOR;
     float_t voltageRMS = voltagePk/SQRT2;
 #ifdef DEBUG_MODE
     Serial.print( "Line freq: " );
@@ -264,6 +265,7 @@ bool cycleCalculation() {
   long numSteps = 0;
   float_t accumulatorPowerPositive = 0;  // split these out for eventual reactive power analysys
   float_t accumulatorPowerNegative = 0;
+  uint32_t accumulatorRMSCurrent = 0;
   uint32_t cycleLengthMicros = g_interruptTimerEnd - g_interruptTimerStart;
   float_t radiansPerMicro = 2.0 * PI / (float_t)cycleLengthMicros;
   uint32_t cycleStartMicros = micros();
@@ -289,6 +291,7 @@ bool cycleCalculation() {
     ++numSteps;
     currentMicros = micros();
     currentCurrentADC = adcRead( CURRENT_LEVEL_CS_PIN ) - g_currentZeroCalibration;
+    accumulatorRMSCurrent += (uint32_t)currentCurrentADC * (uint32_t)currentCurrentADC;
     if (abs(currentCurrentADC) > peakCurrent) {
       peakCurrent = abs(currentCurrentADC);
     }
@@ -316,15 +319,19 @@ bool cycleCalculation() {
   uint32_t totalMeasuredMicros = lastMicros - cycleStartMicros;
   float_t powerPositive = accumulatorPowerPositive * g_voltagePk * ADC_CURRENT_FACTOR / totalMeasuredMicros;
   float_t powerNegative = accumulatorPowerNegative * g_voltagePk * ADC_CURRENT_FACTOR / totalMeasuredMicros;
-  g_current = peakCurrent * ADC_CURRENT_FACTOR / 1000;
+  float_t peakCurrentF = peakCurrent * ADC_CURRENT_FACTOR;
+  float_t powerReal = (powerPositive + powerNegative);
+  float_t powerFactor = powerReal / (g_voltage * sqrt(accumulatorRMSCurrent / numSteps) * ADC_CURRENT_FACTOR); // real power divided by RMS voltage * RMS current
   #ifdef DEBUG_MODE
   Serial.println();
   Serial.print("Measured power for this cycle: ");
   Serial.print(powerPositive, DEC);
   Serial.print(" ");
   Serial.println(powerNegative, DEC);
+  Serial.print("Power factor: ");
+  Serial.println(powerFactor, DEC);
   Serial.print("Peak current: ");
-  Serial.println(g_current, DEC);
+  Serial.println(peakCurrentF, DEC);
   Serial.print("Max timestep: ");
   Serial.println(maxTimeStep, DEC);
   Serial.print("Num steps: ");
@@ -333,8 +340,10 @@ bool cycleCalculation() {
   Serial.println(cycleStartMicros-g_interruptTimerStart);
   #endif
   
-  if (maxTimeStep < 1000) {
-    g_powerReal = (powerPositive + powerNegative) / 1000;
+  if (maxTimeStep < 1000 && numSteps > 50) {
+    g_powerReal = powerReal;
+    g_powerFactor = powerFactor;
+    g_current = peakCurrentF;
     return true;
   } else {
     #ifdef DEBUG_MODE
@@ -531,17 +540,4 @@ uint32_t sensePeakVoltage() {
   yield(); // let chip deal with other functions immediately
   return value;
 }
-
-
-/* conversion functions to real units
- */
-float_t adcToVoltage( uint32_t value ) {
-  return (float_t)value * ADC_VOLTAGE_FACTOR;
-}
-float_t adcToCurrent( uint32_t value ) {
-  if (!value) return 0;
-  return ((float_t)value - g_currentZeroCalibration) * ADC_CURRENT_FACTOR;
-}
-
-
 
