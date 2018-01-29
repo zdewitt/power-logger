@@ -110,3 +110,8 @@ The control and messaging interface for Pwrctl devices consists of the following
   The values are the same as in the **_/sense_** topic with the addition of RMS current, the state of the relay
   (1 on/0 off), the uptime since the device last reset, and a `WavePacket` of the form sent on the **_/wave_**
   topic.
+  
+* ### /debug
+  
+  When `MQTT_DEBUG` is defined, debug messages will be sent over this MQTT topic. Messages may be broken up into
+  many chunks, but will be terminated with `\n\r` chars.
