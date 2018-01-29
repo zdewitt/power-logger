@@ -1,7 +1,7 @@
 /*
  * PwrCtlRevA.ino
  * 
- * Copyright 2017 Zoltan DeWitt
+ * Copyright 2018 Zoltan DeWitt
  * 
  * This program is distributed in the hope that it will be useful,
  * but WITHOUT ANY WARRANTY; without even the implied warranty of
@@ -12,6 +12,11 @@
  *      ESP8266 Arduino: https://github.com/esp8266/Arduino
  *      ESP8266 WiFiManager: https://github.com/tzapu/WiFiManager
  *      ESP8266 TwoColorLed: https://github.com/zdewitt/TwoColorLed
+ *      PubSubClient: https://pubsubclient.knolleary.net
+ *            NOTE: This sketch needs MQTT payloads that are larger
+ *            than the default in the library. Due to the way
+ *            Arduino does imports, this must be changed in the .h file:
+ *                #define MQTT_MAX_PACKET_SIZE 2048
  * 
  * This is a prototype sketch for a Power Logger device
  * It will connect over WiFi to the Enerbits host and log power usage
