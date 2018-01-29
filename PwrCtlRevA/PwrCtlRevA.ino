@@ -73,6 +73,8 @@
 /******** Constants ********/
 
 #define UPDATE_INTERVAL 1000
+#define POLL_INTERVAL 5000
+#define POLL_KEEP_ALIVE_TIMEOUT 120000
 #define MAX_WAVEFORM_SAMPLES 200
 
 /* ADC factors for current/voltage conversions
@@ -138,21 +140,6 @@ typedef struct SensePayload {
   float powerFactor;
 } SensePayload;
 
-/* Polling data payload for MQTT
- * For connecting to the website widget and getting real-time data
- */
-typedef struct PollingPayload {
-  float realPower;
-  float lineFreq;
-  float voltsRMS;
-  float ampsRMS;
-  float powerFactor;
-#ifdef ENABLE_RELAY
-  uint32_t relay;
-#endif
-  uint32_t uptime;
-} PollingPayload;
-
 /* Waveform data point
  * Single data point from a waveform
  */
@@ -171,6 +158,22 @@ typedef struct WavePacket {
   uint32_t midpoint;
   WaveDataPoint data[MAX_WAVEFORM_SAMPLES];
 } WavePacket;
+
+/* Sensing data struct
+ * This stores all the sampled and calculated values from the last
+ * sensing and calculation update. This is sent over mqtt when polling
+ * is active.
+ */
+typedef struct SenseData {
+  float realPower;
+  float lineFreq;
+  float voltsRMS;
+  float ampsRMS;
+  float powerFactor;
+  uint32_t relay;
+  uint32_t uptime;
+  WavePacket wavePacket;
+} SenseData;
 
 /* RTC memory
  * This struct stores the status of the relay and peak power.
@@ -194,6 +197,7 @@ typedef struct RTCMemory {
 typedef struct EEPROMMemory {
   uint16_t currentZeroCalibration;
   uint16_t publishInterval;
+  bool publishWaveform;
   uint32_t crc;
 } EEPROMMemory;
 
@@ -213,6 +217,7 @@ class TimeoutMicros {
       return micros() - _start > _duration;
     };
 };
+
 
 /******** Globals ********/
 
@@ -240,11 +245,6 @@ void mqttCallback(char* topic, byte* payload, unsigned int length);
 volatile uint32_t g_interruptTimerStart = 0;
 volatile uint32_t g_interruptTimerMid = 0;
 volatile uint32_t g_interruptTimerEnd = 0;
-float_t g_lineHz = 0;
-float_t g_voltage = 0;
-float_t g_current = 0;
-float_t g_powerReal = 0;
-float_t g_powerFactor = 0;
 float_t g_lineHzAcc = 0;
 float_t g_voltageAcc = 0;
 float_t g_powerRealAcc = 0;
@@ -252,6 +252,8 @@ float_t g_powerFactorAcc = 0;
 uint32_t g_numSamples = 0;
 uint32_t g_lastUpdateTime = 0;
 uint32_t g_lastPublishTime = 0;
+uint32_t g_lastPollTime = 0;
+uint32_t g_lastPollKeepAlive = 0;
 uint32_t g_adcValueBuffer = 0;
 uint16_t g_adcReadBuffer = 0;
 RTCMemory g_rtcMemory;
@@ -267,7 +269,7 @@ char g_waveformTopic[TOPIC_LEN];
 char g_debugTopic[TOPIC_LEN];
 char g_debugMessageBuf[256];
 #endif
-WavePacket g_wavePacket;
+SenseData g_senseData;
 TwoColorLed led(LED_RED_PIN, LED_GREEN_PIN, false);
 
 
@@ -287,6 +289,7 @@ void setup() {
     #ifdef ENABLE_RELAY
     // Deal with relay control at startup
     digitalWrite(RELAY_ENABLE_PIN, g_rtcMemory.relay);
+    g_senseData.relay = g_rtcMemory.relay;
     #endif
   } else {
     #ifdef ENABLE_RELAY
@@ -294,6 +297,7 @@ void setup() {
     g_rtcMemory.relay = 0;
     #endif
     g_rtcMemory.peakPower = 1.0;
+    g_senseData.relay = 0;
     updateRTC();
   }
   #ifdef ENABLE_RELAY
@@ -354,6 +358,7 @@ void setup() {
     DEBUG_MSG("EEPROM crc mismatch\n\r");
     g_em.currentZeroCalibration = 2^(12+ADC_OVERSAMPLING_BITS)/2;
     g_em.publishInterval = 0;
+    g_em.publishWaveform = false;
   }
 
   //adcTestSPS(); // uncomment this to test the sampling rate at startup
@@ -374,6 +379,7 @@ void loop() {
   ArduinoOTA.handle();
   
   uint32_t currentTime = millis();
+  #ifdef UPDATE_INTERVAL
   if (currentTime - g_lastUpdateTime >= UPDATE_INTERVAL) {
     for (int i=0; i<10; i++) {
       bool valid = updateWaveform();
@@ -389,6 +395,7 @@ void loop() {
     }
     g_lastUpdateTime = currentTime;
   }
+  #endif
   
   if (
     g_em.publishInterval
@@ -397,8 +404,22 @@ void loop() {
   ) {
     if (g_numSamples > 0) {
       publishSense();
+      if (g_em.publishWaveform) {
+        publishWaveform();
+      }
     }
     g_lastPublishTime = currentTime;
+  }
+  
+  if (g_lastPollTime && currentTime - g_lastPollTime >= POLL_INTERVAL) {
+    publishPoll();
+    if (currentTime - g_lastPollKeepAlive < POLL_KEEP_ALIVE_TIMEOUT) {
+      g_lastPollTime = currentTime;
+      if (g_lastPollTime == 0) g_lastPollTime = 1;
+    } else {
+      g_lastPollTime = 0;
+      g_lastPollKeepAlive = 0;
+    }
   }
 }
 
@@ -445,32 +466,24 @@ void publishSense()
 
 void publishPoll()
 {
-  PollingPayload payload = {
-    .realPower = g_powerReal,
-    .lineFreq = g_lineHz,
-    .voltsRMS = g_voltage,
-    .ampsRMS = g_current,
-    .powerFactor = g_powerFactor,
-    #ifdef ENABLE_RELAY
-    .relay = digitalRead(RELAY_ENABLE_PIN),
-    #endif
-    .uptime = millis() / 1000
-  };
-  byte* payloadPtr = reinterpret_cast<byte*>(&payload);
+  uint16_t length = sizeof(SenseData) - sizeof(WaveDataPoint)
+    * (MAX_WAVEFORM_SAMPLES - g_senseData.wavePacket.numSamples);
   mqttClient.publish(
     g_pollTopic,
-    payloadPtr,
-    sizeof(payload)
+    reinterpret_cast<byte*>(&g_senseData),
+    length
   );
-  DEBUG_MSG("Poll %i\n\r", sizeof(payload));
+  DEBUG_MSG("Poll %i\n\r", length);
 }
 
 void publishWaveform()
 {
+  uint16_t length = sizeof(WavePacket) - sizeof(WaveDataPoint)
+    * (MAX_WAVEFORM_SAMPLES - g_senseData.wavePacket.numSamples);
   mqttClient.publish(
     g_waveformTopic,
-    reinterpret_cast<byte*>(&g_wavePacket),
-    g_wavePacket.numSamples * sizeof(WaveDataPoint) + 12
+    reinterpret_cast<byte*>(&g_senseData.wavePacket),
+    length
   );
 }
 
@@ -478,12 +491,16 @@ void mqttCallback(char* topic, byte* payload, unsigned int length)
 {
   if (strcmp(topic, g_controlTopic)==0 && length>0) {
     if (payload[0] == 'p') {
-      // Send a poll message
-      publishPoll();
+      // Keep polling alive
+      g_lastPollKeepAlive = millis();
+      if (!g_lastPollTime) {
+        g_lastPollTime = g_lastPollKeepAlive - POLL_INTERVAL;
+      }
     #ifdef ENABLE_RELAY
     } else if (payload[0] == 'r' && length > 1) {
       // Turn relay on or off
       g_rtcMemory.relay = (payload[1] == '1');
+      g_senseData.relay = g_rtcMemory.relay;
       updateRTC();
       digitalWrite(RELAY_ENABLE_PIN, g_rtcMemory.relay);
       led.setLevel(g_rtcMemory.relay ? 1023 : 0);
@@ -500,9 +517,15 @@ void mqttCallback(char* topic, byte* payload, unsigned int length)
       #endif
       saveEEPROM();
     } else if (payload[0] == 'w') {
-      // Send a waveform
-      publishWaveform();
-    } else if (payload[0] == 'i' && length > 1 && length <= 6) {
+      if (length == 1) {
+        // Send a waveform
+        publishWaveform();
+      } else {
+        // toggle waveform interval publishing
+        g_em.publishWaveform = payload[1] == '1';
+        saveEEPROM();
+      }
+    } else if (payload[0] == 'i' && length > 1 && length <= 5) {
       // Set publish interval, up to 9999 seconds
       char s[5];
       for (int i=1; i<length; i++) {
@@ -566,8 +589,8 @@ bool updateWaveform()
   
   // Loop until valid (max 10)
   do {
-    g_wavePacket.numSamples = 0;
-    g_wavePacket.midpoint = 0;
+    g_senseData.wavePacket.numSamples = 0;
+    g_senseData.wavePacket.midpoint = 0;
     TimeoutMicros timeout(50000);
     g_interruptTimerStart = 0;
     g_interruptTimerMid = 0;
@@ -581,30 +604,30 @@ bool updateWaveform()
     while (
       !g_interruptTimerEnd
       && !timeout.expired()
-      && g_wavePacket.numSamples < MAX_WAVEFORM_SAMPLES
+      && g_senseData.wavePacket.numSamples < MAX_WAVEFORM_SAMPLES
     ) {
       WaveDataPoint* dataPoint =
-        &g_wavePacket.data[g_wavePacket.numSamples];
+        &g_senseData.wavePacket.data[g_senseData.wavePacket.numSamples];
       dataPoint->V_inst = analogRead(VOLTAGE_LEVEL_PIN);
       adcRead();
       dataPoint->I_inst =
         (int16_t)g_adcValueBuffer-g_em.currentZeroCalibration;
       dataPoint->frameMicros =
         micros() - g_interruptTimerStart - SAMPLING_LATENCY_MICROS;
-      g_wavePacket.numSamples++;
+      g_senseData.wavePacket.numSamples++;
     }
     detachInterrupt(VOLTAGE_PULSE_PIN);
-    g_wavePacket.cycleLength =
+    g_senseData.wavePacket.cycleLength =
       g_interruptTimerEnd - g_interruptTimerStart;
-    g_wavePacket.midpoint =
+    g_senseData.wavePacket.midpoint =
       g_interruptTimerMid - g_interruptTimerStart;
     tries++;
     
-    dutyCycle = (float_t)g_wavePacket.midpoint
-      / (float_t)g_wavePacket.cycleLength;
+    dutyCycle = (float_t)g_senseData.wavePacket.midpoint
+      / (float_t)g_senseData.wavePacket.cycleLength;
     valid =
-      MIN_CYCLE_LEN < g_wavePacket.cycleLength
-      && g_wavePacket.cycleLength < MAX_CYCLE_LEN
+      MIN_CYCLE_LEN < g_senseData.wavePacket.cycleLength
+      && g_senseData.wavePacket.cycleLength < MAX_CYCLE_LEN
       && 0.45 < dutyCycle && dutyCycle < 0.55;
     yield();
   } while (!valid && tries < 10);
@@ -620,7 +643,7 @@ bool calcLineValues()
 {
   uint16_t sample = 0;
   uint16_t voltSamples = 0;
-  int32_t midpoint = g_wavePacket.cycleLength / 2;
+  int32_t midpoint = g_senseData.wavePacket.cycleLength / 2;
   float_t sumVSq = 0;
   float_t sumISq = 0;
   float_t sumP = 0;
@@ -631,11 +654,11 @@ bool calcLineValues()
   float_t pf;
   bool voltsPos;
   
-  while (sample < g_wavePacket.numSamples) {
-    WaveDataPoint* dataPoint = &g_wavePacket.data[sample];
+  while (sample < g_senseData.wavePacket.numSamples) {
+    WaveDataPoint* dataPoint = &g_senseData.wavePacket.data[sample];
     voltsPos =
       dataPoint->frameMicros < midpoint
-      || dataPoint->frameMicros > g_wavePacket.cycleLength;
+      || dataPoint->frameMicros > g_senseData.wavePacket.cycleLength;
     
     sumISq +=
       pow(dataPoint->I_inst * ADC_CURRENT_FACTOR, 2);
@@ -660,24 +683,31 @@ bool calcLineValues()
   }
   
   V_rms = sqrt(sumVSq / voltSamples);
-  I_rms = sqrt(sumISq / g_wavePacket.numSamples);
-  P_real = sumP / g_wavePacket.numSamples;
+  I_rms = sqrt(sumISq / g_senseData.wavePacket.numSamples);
+  P_real = sumP / g_senseData.wavePacket.numSamples;
   P_app = V_rms * I_rms;
   pf = P_real / P_app;
   
   if (80 < V_rms && V_rms < 400) {
-    g_lineHz = 1000000.0 / g_wavePacket.cycleLength;
-    g_voltage = V_rms;
-    g_current = I_rms;
-    g_powerReal = P_real;
-    g_powerFactor = pf;
+    // Update instantaneous values
+    g_senseData.lineFreq = 1000000.0 / g_senseData.wavePacket.cycleLength;
+    g_senseData.voltsRMS = V_rms;
+    g_senseData.ampsRMS = I_rms;
+    g_senseData.realPower = P_real;
+    g_senseData.powerFactor = pf;
+    // Add to publishing accumulators
+    g_numSamples++;
+    g_lineHzAcc += g_senseData.lineFreq;
+    g_voltageAcc += g_senseData.voltsRMS;
+    g_powerRealAcc += g_senseData.realPower;
+    g_powerFactorAcc += g_senseData.powerFactor;
     return true;
   } else {
-    g_lineHz = 0;
-    g_voltage = 0;
-    g_current = 0;
-    g_powerReal = 0;
-    g_powerFactor = 0;
+    g_senseData.lineFreq = 0;
+    g_senseData.voltsRMS = 0;
+    g_senseData.ampsRMS = 0;
+    g_senseData.realPower = 0;
+    g_senseData.powerFactor = 0;
     DEBUG_MSG("%f %f %f %f\n\r", V_rms, I_rms, P_real, pf);
     return false;
   }
@@ -694,158 +724,28 @@ int16_t interpVoltage(int32_t t)
   int32_t t1;
   int32_t t2;
   do {
-    if (t<g_wavePacket.data[sample].frameMicros) break;
+    if (t<g_senseData.wavePacket.data[sample].frameMicros) break;
     sample++;
-  } while (sample < g_wavePacket.numSamples);
+  } while (sample < g_senseData.wavePacket.numSamples);
   if (sample == 0) {
     v1 = 0;
-    v2 = g_wavePacket.data[0].V_inst;
+    v2 = g_senseData.wavePacket.data[0].V_inst;
     t1 = 0;
-    t2 = g_wavePacket.data[0].frameMicros;
-  } else if (sample == g_wavePacket.numSamples) {
-    v1 = g_wavePacket.data[g_wavePacket.numSamples-1].V_inst;
+    t2 = g_senseData.wavePacket.data[0].frameMicros;
+  } else if (sample == g_senseData.wavePacket.numSamples) {
+    v1 = g_senseData.wavePacket.data[
+      g_senseData.wavePacket.numSamples-1].V_inst;
     v2 = 0;
-    t1 = g_wavePacket.data[g_wavePacket.numSamples-1].frameMicros;
-    t2 = g_wavePacket.cycleLength;
+    t1 = g_senseData.wavePacket.data[
+      g_senseData.wavePacket.numSamples-1].frameMicros;
+    t2 = g_senseData.wavePacket.cycleLength;
   } else {
-    v1 = g_wavePacket.data[sample-1].V_inst;
-    v2 = g_wavePacket.data[sample].V_inst;
-    t1 = g_wavePacket.data[sample-1].frameMicros;
-    t2 = g_wavePacket.data[sample].frameMicros;
+    v1 = g_senseData.wavePacket.data[sample-1].V_inst;
+    v2 = g_senseData.wavePacket.data[sample].V_inst;
+    t1 = g_senseData.wavePacket.data[sample-1].frameMicros;
+    t2 = g_senseData.wavePacket.data[sample].frameMicros;
   }
   return (v2-v1)*(t-t1)/(t2-t1) + v1;
-}
-
-/* update the g_powerReal and g_current vars with new values.
- * performs a numerical integration on a single cycle of the
- * voltage and current waveforms. voltage is approximated as a
- * sin wave using the peak voltage and cycle period
- */
-/*bool updatePower()
-{
-  // get a rising edge from the voltage pulse to synchronize the timing
-  uint8_t tries = 0;
-  uint32_t cycleLength = 0;
-  bool valid = false;
-  do {
-    uint32_t startTime = micros();
-    g_interruptTimerStart = 0;
-    g_interruptTimerEnd = 0;
-    attachInterrupt(VOLTAGE_PULSE_PIN, timingHandler, RISING);
-    while (!g_interruptTimerEnd && ((micros() - startTime) < 50000)) {
-      yield();
-    }
-    detachInterrupt(VOLTAGE_PULSE_PIN);
-    cycleLength = g_interruptTimerEnd - g_interruptTimerStart;
-    tries++;
-    valid = MIN_CYCLE_LEN < cycleLength && cycleLength < MAX_CYCLE_LEN;
-  } while (!valid && tries < 10);
-  if (!valid) return false;
-  
-  // local vars for entire cycle
-  long peakCurrent = 0;
-  uint32_t maxTimeStep = 0;
-  long numSteps = 0;
-  // split these out for eventual reactive power analysys
-  float_t accumulatorPowerPositive = 0;
-  float_t accumulatorPowerNegative = 0;
-  uint32_t accumulatorRMSCurrent = 0;
-  uint32_t cycleLengthMicros =
-    g_interruptTimerEnd - g_interruptTimerStart;
-  float_t radiansPerMicro = 2.0 * PI / (float_t)cycleLengthMicros;
-  uint32_t cycleStartMicros = micros();
-  
-  // local vars for each integration step
-  long lastCurrentADC = 0;
-  long currentCurrentADC = 0;
-  uint32_t currentMicros = cycleStartMicros;
-  uint32_t lastMicros = currentMicros;
-  long averageCurrentADC = 0;
-  float_t averageRadians = 0;
-  float_t averageNormalizedVoltage = 0;
-  uint32_t timestepMicros = 0;
-  float_t currentWeightedNormalizedPower = 0;
-  
-  // calculate the integral for one cycle period.
-  // we substitute sin(radians) for the voltage and multiply by the
-  // peak later. the calculation is not synced with the cycle period,
-  // but the important factors are that radians are correct and that
-  // the duration is one period.
-  
-  adcRead();
-  lastCurrentADC = g_adcValueBuffer - g_em.currentZeroCalibration;
-  while (lastMicros - cycleStartMicros <= cycleLengthMicros) {
-    ++numSteps;
-    currentMicros = micros();
-    adcRead();
-    currentCurrentADC = g_adcValueBuffer - g_em.currentZeroCalibration;
-    accumulatorRMSCurrent +=
-      (uint32_t)currentCurrentADC * (uint32_t)currentCurrentADC;
-    if (abs(currentCurrentADC) > peakCurrent) {
-      peakCurrent = abs(currentCurrentADC);
-    }
-    if (lastMicros) {
-      // numerical integration using straight line approximation
-      averageCurrentADC = (lastCurrentADC + currentCurrentADC) / 2;
-      averageRadians =
-        (
-          lastMicros - g_interruptTimerStart
-          + currentMicros - g_interruptTimerStart
-        ) / 2 * radiansPerMicro;
-      averageNormalizedVoltage = sin(averageRadians);
-      timestepMicros = currentMicros - lastMicros;
-      if (timestepMicros > maxTimeStep) maxTimeStep = timestepMicros;
-      currentWeightedNormalizedPower =
-        averageCurrentADC * averageNormalizedVoltage * timestepMicros;
-      if (currentWeightedNormalizedPower > 0) {
-        accumulatorPowerPositive += currentWeightedNormalizedPower;
-      } else {
-        accumulatorPowerNegative += currentWeightedNormalizedPower;
-      }
-    }
-    lastCurrentADC = currentCurrentADC;
-    lastMicros = currentMicros;
-  }
-  
-  yield();
-  
-  // final conversions to real units and global var updates
-  uint32_t totalMeasuredMicros = lastMicros - cycleStartMicros;
-  float_t powerPositive =
-    accumulatorPowerPositive * g_voltagePk * ADC_CURRENT_FACTOR
-    / totalMeasuredMicros;
-  float_t powerNegative =
-    accumulatorPowerNegative * g_voltagePk * ADC_CURRENT_FACTOR
-    / totalMeasuredMicros;
-  float_t peakCurrentF = peakCurrent * ADC_CURRENT_FACTOR;
-  float_t powerReal = (powerPositive + powerNegative);
-  float_t powerFactor =
-    powerReal 
-    / (
-      g_voltage * sqrt(accumulatorRMSCurrent / numSteps)
-      * ADC_CURRENT_FACTOR
-    ); // real power divided by RMS voltage * RMS current
-  
-  if (maxTimeStep < 1000 && numSteps > 50) {
-    g_powerReal = powerReal;
-    g_powerFactor = powerFactor;
-    g_current = peakCurrentF;
-    g_powerRealAcc += powerReal;
-    g_powerFactorAcc += powerFactor;
-    g_lineHzAcc += g_lineHz;
-    g_voltageAcc += g_voltage;
-    g_numSamples++;
-    if (g_powerReal > g_rtcMemory.peakPower) {
-      g_rtcMemory.peakPower = g_powerReal;
-      updateRTC();
-    }
-    int newColor = 1023 * (1.0 - (g_powerReal / g_rtcMemory.peakPower));
-    if (g_powerReal < 1.0) newColor=1023;
-    led.setColor(newColor);
-    return true;
-  } else {
-    return false;
-  }
 }
 
 
