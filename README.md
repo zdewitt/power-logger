@@ -87,8 +87,10 @@ The control and messaging interface for Pwrctl devices consists of the following
   real volts and amps the following conversion factors are useful:
   ```
   V = V_inst * 0.3873416081
-  I = I_inst * 0.012207031
+  I = I_inst * 0.012207031 / (1 << ADC_OVERSAMPLING_BITS)
   ```
+  For the `I_inst` samples, the conversion factor depends on the number of oversampling bits. This parameter
+  is currently set to 1.
 
 * ### /poll
   

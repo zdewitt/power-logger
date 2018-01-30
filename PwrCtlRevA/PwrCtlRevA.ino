@@ -95,7 +95,7 @@
 
 // Oversampling the current sensor provides better value resolution,
 // at the expense of temporal resolution. Maximum 2 bits
-#define ADC_OVERSAMPLING_BITS 0
+#define ADC_OVERSAMPLING_BITS 1
 
 const float_t ADC_VOLTAGE_FACTOR = ADC_VOLTAGE_FACTOR_10BIT;
 const float_t ADC_CURRENT_FACTOR =
@@ -112,7 +112,7 @@ const float_t SQRT2 = 1.4142136;
 
 // SPI settings for the ADC121S021
 const SPISettings ADC121S021_spi_settings(
-  SPI_CLOCK_DIV4, MSBFIRST, SPI_MODE0
+  SPI_CLOCK_DIV4, MSBFIRST, SPI_MODE3
 );
 
 // MQTT settings
@@ -234,7 +234,6 @@ bool updateWaveform();
 bool calcLineValues();
 int16_t interpVoltage(int32_t t);
 void adcRead();
-void adcReadRaw();
 void adcTestSPS();
 uint32_t calculateCRC32(const uint8_t *data, size_t length);
 void updateRTC();
@@ -765,50 +764,17 @@ void adcRead()
   g_adcValueBuffer = 0;
   g_adcReadBuffer = 0;
   SPI.beginTransaction(ADC121S021_spi_settings);
-  
-  adcReadRaw();
-#if ADC_OVERSAMPLING_BITS > 0
-  adcReadRaw();
-  adcReadRaw();
-  adcReadRaw();
-#endif
-#if ADC_OVERSAMPLING_BITS > 1
-  adcReadRaw();
-  adcReadRaw();
-  adcReadRaw();
-  adcReadRaw();
-  adcReadRaw();
-  adcReadRaw();
-  adcReadRaw();
-  adcReadRaw();
-  adcReadRaw();
-  adcReadRaw();
-  adcReadRaw();
-  adcReadRaw();
-#endif
+  for (int i=0; i < 1<<(ADC_OVERSAMPLING_BITS*2); i++) {
+    digitalWrite(CURRENT_LEVEL_CS_PIN, LOW);
+    g_adcReadBuffer = SPI.transfer16(0);
+    digitalWrite(CURRENT_LEVEL_CS_PIN, HIGH);
+    g_adcReadBuffer = g_adcReadBuffer >> 1;  // see timing diagram
+    // mask the unused 4 upper bits. Fix: is this necessary?
+    g_adcReadBuffer &= 0b0000111111111111; 
+    g_adcValueBuffer = g_adcValueBuffer + g_adcReadBuffer;
+  }
   SPI.endTransaction();
-#if ADC_OVERSAMPLING_BITS > 0
   g_adcValueBuffer = g_adcValueBuffer >> ADC_OVERSAMPLING_BITS;
-#endif
-}
-
-/* ADC reads for TI-ADC121S021
- * this function accumulates into the g_adcValueBuffer each
- * time it is called
- */
-void adcReadRaw()
-{
-  digitalWrite(CURRENT_LEVEL_CS_PIN, LOW);
-  g_adcReadBuffer = SPI.transfer16(0);
-  digitalWrite(CURRENT_LEVEL_CS_PIN, HIGH);
-   /* first 3 bits are null, so shift bits down 1 (total of 4)
-    * NOTE: the timing diagrams would suggest this, but testing
-    * proved otherwise. Not sure why?
-    */
-  //g_adcReadBuffer = g_adcReadBuffer >> 1;
-  // mask the unused 4 upper bits. Fix: is this necessary?
-  g_adcReadBuffer &= 0b0000111111111111; 
-  g_adcValueBuffer = g_adcValueBuffer + g_adcReadBuffer;
 }
 
 /* debug function for testing the sampling rate under current params.
