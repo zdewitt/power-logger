@@ -8,7 +8,7 @@ real-time. They are powered from the line voltage so no batteries or other power
 operation. Optional on relay-enabled devices is a control relay that can be used to control the load.
 
 Pwrctl devices sense watts, volts, amps, Hz, and power factor in real-time and can be configured to publish
-average values on a set interval to a server. High-frequency waveform data (~8ksps) can also be obtained and
+average values on a set interval to a server. High-frequency waveform data (~6ksps) can also be obtained and
 written to a server, or polled in real-time.
 
 ## MQTT Interface
