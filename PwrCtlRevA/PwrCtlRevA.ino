@@ -30,7 +30,7 @@
 //#define ENABLE_RELAY
 
 // enable serial messages for hardware testing
-#define MQTT_DEBUG
+//#define MQTT_DEBUG
 
 // for old versions of the hardware
 //#define OLD_PINOUT
@@ -287,7 +287,6 @@ void setup() {
   uint32_t crcOfData = calculateCRC32(
     ((uint8_t*) &g_rtcMemory), sizeof(g_rtcMemory) - 4
   );
-  bool rtcValid = (crcOfData == g_rtcMemory.crc);
   
   if (crcOfData == g_rtcMemory.crc) {
     #ifdef ENABLE_RELAY
@@ -344,7 +343,8 @@ void setup() {
   led.setBlink(250);
   led.setColor(400);
   
-  wifiManager.autoConnect();
+  wifiManager.setConfigPortalTimeout(180);
+  while (!wifiManager.autoConnect()) {}
 
   // solid green when connected
   led.setColor(1023);
